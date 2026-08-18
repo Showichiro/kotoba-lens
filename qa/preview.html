@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ことばレンズ QA プレビュー</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; color: #28312e; background: #fff; font-family: Inter, "Yu Gothic UI", system-ui, sans-serif; }
+      header { display: flex; align-items: center; gap: 34px; height: 100px; padding: 0 34px; border-bottom: 1px solid #ddd; }
+      .brand { padding: 5px 12px; border-radius: 4px; background: #2fa90b; color: white; font-size: 30px; font-weight: 800; }
+      nav { display: flex; gap: 28px; color: #4d5753; font-weight: 700; }
+      main { max-width: 960px; margin: 0 auto; padding: 26px 18px 80px; }
+      .hero { padding: 34px 38px; border-radius: 12px; background: #142a22; color: white; }
+      .hero p { margin: 0 0 8px; color: #f7cc64; font-size: 16px; font-weight: 800; }
+      .hero h1 { max-width: 720px; margin: 0; font-size: 36px; line-height: 1.3; }
+      article { margin-top: 34px; }
+      article h2 { margin: 34px 0 14px; font-size: 25px; }
+      article p { margin: 0 0 20px; font-size: 17px; line-height: 1.9; }
+      .meta { margin: 18px 0; color: #6b7772; font-size: 13px; }
+    </style>
+    <script>
+      globalThis.chrome = {
+        i18n: { getUILanguage() { return "ja"; } },
+        storage: { local: { async get() { return {}; }, async set() {} } },
+        runtime: { onMessage: { addListener() {} } }
+      };
+      class MockLanguageModel {
+        static async availability() { return "available"; }
+        static async create() { return new MockLanguageModel(); }
+        async prompt(prompt, options = {}) {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          if (options.responseConstraint) {
+            if (prompt.includes("Translate both JSON string values")) {
+              return JSON.stringify({
+                meaning: "AIが出力した作業結果を、Markdownのままだと読みづらいと感じ、HTMLとして共有・閲覧しやすくするツールを作った、ということです。",
+                connection: "背景の課題提起から始まり、ツールの機能や使い方、導入の利点までを一貫して説明する記事の要点です。"
+              });
+            }
+            if (prompt.includes("Rewrite the explanation only")) {
+              return JSON.stringify({
+                meaning: "Markdownのままだと読む人によって表示が異なるため、HTMLに変換して同じ見た目で共有できるようにした、という意味です。",
+                connection: "記事は、読みづらさという課題から始まり、変換方法と共有手順までを順番に説明しています。"
+              });
+            }
+            return JSON.stringify({
+              meaning: "The author built a tool that converts Markdown results into HTML so they are easier to read and share.",
+              connection: "This leads from the article's initial problem to its implementation and usage guidance."
+            });
+          }
+          return "AIの出力を読みやすく共有するためのHTML変換ツールを紹介しています。\n課題、実装方法、使い方を順番に説明しています。\nローカル処理で情報を外部へ送らない設計です。";
+        }
+      }
+      globalThis.LanguageModel = MockLanguageModel;
+    </script>
+  </head>
+  <body>
+    <header>
+      <div class="brand">Qiita</div>
+      <nav><span>トレンド</span><span>ストックリスト</span><span>質問</span><span>公式イベント</span><span>公式コラム</span></nav>
+    </header>
+    <main>
+      <section class="hero">
+        <p>Qiita AI Summit</p>
+        <h1>AI駆動開発を実現するエンジニアリング戦略</h1>
+      </section>
+      <article>
+        <p class="meta">2026年08月16日　個人開発 / AI / ClaudeCode</p>
+        <h2>AIエージェントの作業結果を読みやすく共有する</h2>
+        <p>AIエージェントが出力する作業結果はMarkdownで提供されます。しかし、読む環境によって表示が変わり、内容を確認する人に負担がかかることがあります。</p>
+        <p id="target">AIエージェントの作業結果、Markdownで読むの辛くない？ →「HTML共有くん」を作りました。</p>
+        <h2>この記事で解決すること</h2>
+        <p>そこで、MarkdownをHTMLへ変換し、ブラウザですぐに確認できる小さなツールを作りました。変換処理は端末内で完結します。</p>
+        <p>記事では、背景にある課題、ツールの実装方法、利用手順、導入した場合の利点を順番に紹介します。</p>
+        <h2>ローカル処理を選んだ理由</h2>
+        <p>作業結果には開発中の情報が含まれる可能性があるため、外部サービスへ送信しない構成にしました。</p>
+      </article>
+    </main>
+    <script src="/dist/content.js"></script>
+    <script>
+      setTimeout(() => {
+        const target = document.querySelector("#target");
+        const range = document.createRange();
+        range.selectNodeContents(target);
+        const selection = getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.dispatchEvent(new Event("selectionchange"));
+        setTimeout(() => {
+          const lens = document.querySelector("#kotoba-lens-root");
+          lens.shadowRoot.querySelector("#selection-action").click();
+        }, 180);
+      }, 500);
+    </script>
+  </body>
+</html>
