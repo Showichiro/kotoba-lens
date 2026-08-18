@@ -20,6 +20,18 @@ The source and reported implementation were both opened and inspected, but a nor
 
 ## Findings and fixes
 
+- [P1] Contextual explanation can fail with the internal error `kErrorUnknown`.
+  - Location: shared local-model session lifecycle in `promptModel()` and `explainSelection()`.
+  - Evidence: the reported SQLite page capture shows `An unknown error occurred: kErrorUnknown` immediately after selecting a long passage.
+  - Impact: the primary contextual-reading action fails and exposes an implementation detail to the user.
+  - Fix applied: interrupting automatic summary generation now destroys the affected session before contextual explanation begins. Transient unknown/session errors rebuild the model and retry once, long-page context is capped at 8,000 characters while retaining page summary, outline, selected paragraph, and related excerpts, and raw internal errors are replaced by an actionable localized message.
+
+- [P1] Structured summary response is rendered as visible JSON syntax.
+  - Location: `generateSummaryInternal()`, summary response normalization, summary cache.
+  - Evidence: the reported summary card displays ` ```json`, `{`, and `"summary": [` as its three bullet lines.
+  - Impact: the automatic summary is unreadable even though generation completed successfully.
+  - Fix applied: summary generation now uses an explicit three-string JSON schema, unwraps fenced JSON, objects, and arrays before rendering, rejects malformed line counts, and invalidates the affected cache generation.
+
 - [P1] Summary and explanation cards can open simultaneously.
   - Location: `.summary-card`, `.explanation-card`, `generateSummaryInternal()`.
   - Evidence: the reported screenshot shows the explanation card beginning before the summary card ends.
@@ -46,6 +58,7 @@ The source and reported implementation were both opened and inspected, but a nor
 - Production build: passed after fixes.
 - Automatic summary versus explanation exclusivity: verified statically through shared state guards.
 - Preferred-language mismatch retry: covered by the QA fixture with an intentionally English first response and Japanese translation response.
+- Model session recovery: TypeScript check and production build passed; live `kErrorUnknown` recovery awaits confirmation in the user's Chrome runtime.
 - Browser post-fix interaction test and console check: pending a fresh browser capture.
 
 ## Comparison history
@@ -53,14 +66,17 @@ The source and reported implementation were both opened and inspected, but a nor
 1. Initial implementation: browser capture unavailable in the managed environment.
 2. User-reported implementation capture: identified P1 overlap and P1 response-language mismatch.
 3. Fix pass: added mutually exclusive card state, BCP-47 language requirements, language-specific cache, and mismatch retry.
-4. Post-fix capture: pending.
+4. User-reported JSON rendering pass: added structured summary parsing and invalidated the affected cache version.
+5. User-reported contextual explanation failure: added safe session replacement, one transient retry, bounded long-page context, and user-facing error copy.
+6. Post-fix capture: pending.
 
 ## Implementation checklist
 
 1. Reload the unpacked extension from `dist`.
 2. Confirm that selecting text closes the summary card and prevents it from reopening when summary generation finishes.
 3. Confirm that the explanation follows Chrome's UI language on a page written in another language.
-4. Capture the same state again and complete the normalized visual comparison.
+4. On a long page, select text while automatic summary generation is still running and confirm contextual explanation succeeds.
+5. Capture the same state again and complete the normalized visual comparison.
 
 ## Follow-up polish
 

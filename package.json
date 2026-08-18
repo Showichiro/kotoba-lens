@@ -2,7 +2,17 @@
   "name": "kotoba-lens",
   "version": "0.2.0",
   "private": true,
-  "description": "Chrome's local Prompt API rewrites the web in any voice you describe.",
+  "description": "A contextual reading assistant powered by Chrome's on-device Prompt API.",
+  "license": "Apache-2.0",
+  "author": "Showichiro",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Showichiro/kotoba-lens.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Showichiro/kotoba-lens/issues"
+  },
+  "homepage": "https://github.com/Showichiro/kotoba-lens#readme",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",

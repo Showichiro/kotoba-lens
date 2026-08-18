@@ -46,7 +46,8 @@ const AI_OPTIONS = {
 
 const MAX_PAGE_CHARS = 16_000;
 const MAX_SELECTION_CHARS = 1_000;
-const SUMMARY_CACHE_KEY = "kotobaLensSummariesV3";
+const MAX_EXPLANATION_CONTEXT_CHARS = 8_000;
+const SUMMARY_CACHE_KEY = "kotobaLensSummariesV4";
 const MODEL_TIMEOUT_MS = 90_000;
 const UI_HOST_ID = "kotoba-lens-root";
 
@@ -365,7 +366,31 @@ async function getModel(): Promise<LanguageModel> {
   }
 }
 
-async function promptModel(
+async function destroyModelSession() {
+  const pendingModel = modelPromise;
+  modelPromise = null;
+  if (!pendingModel) return;
+  try {
+    const model = await pendingModel;
+    model.destroy();
+  } catch {
+    // A failed or half-created session has nothing left to destroy.
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError"
+    || error instanceof Error && /abort/i.test(error.message);
+}
+
+function isTransientModelError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return /kErrorUnknown|unknown error|invalidstateerror|invalid state|session (?:was )?(?:closed|destroyed)/i.test(
+    `${error.name} ${error.message}`
+  );
+}
+
+async function promptModelOnce(
   prompt: string,
   options: { responseConstraint?: Record<string, unknown> } = {}
 ): Promise<string> {
@@ -379,6 +404,22 @@ async function promptModel(
     window.clearTimeout(timeout);
     if (activePromptController === controller) activePromptController = null;
   }
+}
+
+async function promptModel(
+  prompt: string,
+  options: { responseConstraint?: Record<string, unknown> } = {}
+): Promise<string> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await promptModelOnce(prompt, options);
+    } catch (error) {
+      if (isAbortError(error) || attempt > 0 || !isTransientModelError(error)) throw error;
+      console.info("ことばレンズ: ローカルAIセッションを作り直して再試行します");
+      await destroyModelSession();
+    }
+  }
+  throw new Error("ローカルAIの処理に失敗しました。");
 }
 
 async function getCachedSummary(context: PageContext): Promise<string> {
@@ -402,11 +443,66 @@ function summaryPrompt(context: PageContext): string {
     `Page title: ${context.title}`,
     `Headings: ${context.outline.join(" / ")}`,
     "Read the complete page text below and create a factual summary.",
-    "Return exactly three non-empty lines. No title, bullets, numbering, or commentary.",
+    "Return exactly three concise, non-empty summary strings in the required response schema.",
     "Each line should add a different important point and preserve important names and numbers.",
     "Complete page text:",
     context.fullText
   ].join("\n\n");
+}
+
+const summarySchema = {
+  type: "object",
+  properties: {
+    summary: {
+      type: "array",
+      items: { type: "string" },
+      minItems: 3,
+      maxItems: 3
+    }
+  },
+  required: ["summary"],
+  additionalProperties: false
+};
+
+function summaryLinesFromParsed(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (typeof value === "string") return value.split(/\r?\n/);
+  if (!value || typeof value !== "object") return [];
+  const object = value as Record<string, unknown>;
+  return summaryLinesFromParsed(object.summary ?? object.lines ?? object.summaryLines ?? object.data);
+}
+
+function cleanSummaryLine(value: string): string {
+  return normalizeText(value)
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/, "")
+    .replace(/^[-*•・]\s*/, "")
+    .replace(/^\d+[.)]\s*/, "")
+    .replace(/^['"]|['"],?$/g, "")
+    .trim();
+}
+
+function normalizeSummaryResponse(value: string): string {
+  const trimmed = value.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+  let lines: string[] = [];
+  const jsonCandidates = [trimmed];
+  const objectStart = trimmed.indexOf("{");
+  const objectEnd = trimmed.lastIndexOf("}");
+  if (objectStart >= 0 && objectEnd > objectStart) jsonCandidates.push(trimmed.slice(objectStart, objectEnd + 1));
+  for (const candidate of jsonCandidates) {
+    try {
+      lines = summaryLinesFromParsed(JSON.parse(candidate));
+      if (lines.length) break;
+    } catch {
+      // Some local-model responses are plain text despite a response schema.
+    }
+  }
+  if (!lines.length) lines = trimmed.split(/\r?\n/);
+  const cleaned = lines
+    .map(cleanSummaryLine)
+    .filter((line) => line && !/^(?:[{}\[\]]|"?(?:summary|lines|summaryLines)"?\s*:\s*\[?)$/i.test(line));
+  if (cleaned.length !== 3) throw new Error("ローカルAIから正しい3行要約を取得できませんでした。");
+  return cleaned.join("\n");
 }
 
 function languageRequirement(): string {
@@ -425,12 +521,13 @@ function appearsInPreferredLanguage(value: string): boolean {
 
 async function localizeSummaryIfNeeded(value: string): Promise<string> {
   if (appearsInPreferredLanguage(value)) return value;
-  return (await promptModel([
+  const translated = await promptModel([
     languageRequirement(),
     "Translate the following three-line summary into the required language.",
-    "Return exactly three non-empty lines with no title, bullets, numbering, or commentary.",
+    "Return exactly three concise strings in the required response schema.",
     value
-  ].join("\n\n"))).trim();
+  ].join("\n\n"), { responseConstraint: summarySchema });
+  return normalizeSummaryResponse(translated);
 }
 
 function revealSummaryWhenAppropriate() {
@@ -452,9 +549,10 @@ async function generateSummaryInternal(context: PageContext) {
   }
 
   try {
-    const result = await localizeSummaryIfNeeded((await promptModel(summaryPrompt(context))).trim());
+    const response = await promptModel(summaryPrompt(context), { responseConstraint: summarySchema });
+    const result = await localizeSummaryIfNeeded(normalizeSummaryResponse(response));
     if (pageContext?.hash !== context.hash || !result) return;
-    summary = result.split(/\r?\n/).map(normalizeText).filter(Boolean).slice(0, 3).join("\n");
+    summary = result;
     await storeSummary(context, summary);
     setSummaryStatus("ready");
     renderSummary();
@@ -499,7 +597,7 @@ function relevantBlocks(context: PageContext, selection: string, paragraph: stri
 }
 
 function explanationContext(context: PageContext): string {
-  if (context.fullText.length <= 11_000) return context.fullText;
+  if (context.fullText.length <= MAX_EXPLANATION_CONTEXT_CHARS) return context.fullText;
   const related = relevantBlocks(context, selectedText, selectedParagraph);
   return [
     `Page-wide summary already prepared: ${summary || "not ready yet"}`,
@@ -508,7 +606,12 @@ function explanationContext(context: PageContext): string {
     selectedParagraph,
     "Most relevant excerpts from across the page:",
     ...related.map((block) => `[${block.heading}]\n${block.text}`)
-  ].join("\n\n");
+  ].join("\n\n").slice(0, MAX_EXPLANATION_CONTEXT_CHARS);
+}
+
+function explanationErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && /Prompt API|ローカルAI|この端末/.test(error.message)) return error.message;
+  return fallback;
 }
 
 const explanationSchema = {
@@ -560,8 +663,10 @@ async function explainSelection() {
   explanationActions.hidden = true;
 
   explanationPriority = true;
+  const interruptedModelWork = activePromptController !== null || summaryPromise !== null;
   activePromptController?.abort();
   if (summaryPromise) await summaryPromise.catch(() => undefined);
+  if (interruptedModelWork) await destroyModelSession();
 
   try {
     const result = await promptModel([
@@ -580,7 +685,10 @@ async function explainSelection() {
   } catch (error) {
     console.warn("ことばレンズ: 解説に失敗しました", error);
     meaningElement.classList.remove("loading");
-    meaningElement.textContent = error instanceof Error ? error.message : "この箇所を解説できませんでした。";
+    meaningElement.textContent = explanationErrorMessage(
+      error,
+      "ローカルAIの処理に失敗しました。もう一度選択してお試しください。"
+    );
   } finally {
     explanationPriority = false;
     if (!summary && summaryStatus !== "ready") {
@@ -614,7 +722,10 @@ async function refineExplanation(mode: ExplanationMode) {
     renderExplanation(await parseLocalizedExplanation(result));
   } catch (error) {
     meaningElement.classList.remove("loading");
-    meaningElement.textContent = error instanceof Error ? error.message : "説明を書き換えられませんでした。";
+    meaningElement.textContent = explanationErrorMessage(
+      error,
+      "説明を書き換えられませんでした。もう一度お試しください。"
+    );
     explanationActions.hidden = false;
   }
 }

@@ -59,4 +59,4 @@ Chrome の組み込み AI の要件と API は [Prompt API 公式ドキュメン
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE) © 2026 Showichiro

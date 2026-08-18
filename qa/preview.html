@@ -31,6 +31,20 @@
         async prompt(prompt, options = {}) {
           await new Promise((resolve) => setTimeout(resolve, 80));
           if (options.responseConstraint) {
+            if (prompt.includes("complete page text") || prompt.includes("Complete page text")) {
+              return "```json\n" + JSON.stringify({ summary: [
+                "AIの出力を読みやすく共有するためのHTML変換ツールを紹介しています。",
+                "課題、実装方法、使い方を順番に説明しています。",
+                "ローカル処理で情報を外部へ送らない設計です。"
+              ] }, null, 2) + "\n```";
+            }
+            if (prompt.includes("Translate the following three-line summary")) {
+              return JSON.stringify({ summary: [
+                "AIの出力を読みやすく共有するためのHTML変換ツールを紹介しています。",
+                "課題、実装方法、使い方を順番に説明しています。",
+                "ローカル処理で情報を外部へ送らない設計です。"
+              ] });
+            }
             if (prompt.includes("Translate both JSON string values")) {
               return JSON.stringify({
                 meaning: "AIが出力した作業結果を、Markdownのままだと読みづらいと感じ、HTMLとして共有・閲覧しやすくするツールを作った、ということです。",
