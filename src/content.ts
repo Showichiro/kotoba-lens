@@ -1,6 +1,11 @@
 type SummaryStatus = "reading" | "ready" | "error";
 type ExplanationMode = "simple" | "premise" | "example";
 
+type ModelPromptOptions = {
+  responseConstraint?: Record<string, unknown>;
+  omitResponseConstraintInput?: boolean;
+};
+
 type PageBlock = {
   index: number;
   text: string;
@@ -43,19 +48,40 @@ const AI_OPTIONS = {
   expectedInputs: [{ type: "text" as const, languages: INPUT_LANGUAGES }],
   expectedOutputs: [{ type: "text" as const, languages: [PREFERRED_LANGUAGE_BASE] }]
 };
+const SUMMARIZER_OPTIONS = {
+  type: "key-points" as const,
+  format: "plain-text" as const,
+  length: "short" as const,
+  expectedInputLanguages: INPUT_LANGUAGES,
+  expectedContextLanguages: INPUT_LANGUAGES,
+  outputLanguage: PREFERRED_LANGUAGE_BASE
+};
 
 const MAX_PAGE_CHARS = 16_000;
+const MAX_SUMMARY_CHARS = 8_000;
 const MAX_SELECTION_CHARS = 1_000;
 const MAX_EXPLANATION_CONTEXT_CHARS = 8_000;
-const SUMMARY_CACHE_KEY = "kotobaLensSummariesV4";
+const SUMMARY_CACHE_KEY = "kotobaLensSummariesV5";
+const STORAGE_TIMEOUT_MS = 5_000;
+const MODEL_AVAILABILITY_TIMEOUT_MS = 10_000;
+const MODEL_SETUP_TIMEOUT_MS = 120_000;
+const MODEL_CLONE_TIMEOUT_MS = 10_000;
 const MODEL_TIMEOUT_MS = 90_000;
+const CONTEXT_USAGE_TIMEOUT_MS = 5_000;
+const SUMMARY_CONTEXT_RATIO = 0.65;
+const SUMMARY_RETRY_CONTEXT_RATIO = 0.5;
 const UI_HOST_ID = "kotoba-lens-root";
 
 let pageContext: PageContext | null = null;
 let summary = "";
 let summaryStatus: SummaryStatus = "reading";
+let summaryLoadingMessage = "ページ全体を読んでいます";
+let summaryErrorMessage = "";
 let summaryPromise: Promise<void> | null = null;
 let modelPromise: Promise<LanguageModel> | null = null;
+let modelReady = false;
+let summarizerPromise: Promise<Summarizer> | null = null;
+let summarizerReady = false;
 let activePromptController: AbortController | null = null;
 let explanationPriority = false;
 let selectedText = "";
@@ -64,6 +90,9 @@ let selectedRect: DOMRect | null = null;
 let currentExplanation: Explanation | null = null;
 let contextRefreshTimer = 0;
 let selectionTimer = 0;
+let contextDirty = false;
+let navigationDirty = false;
+let observedContentRoot: Element | null = null;
 
 const host = document.createElement("div");
 host.id = UI_HOST_ID;
@@ -255,12 +284,42 @@ function normalizeText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+const EXCLUDED_CONTENT_SELECTOR = [
+  "script",
+  "style",
+  "noscript",
+  "textarea",
+  "input",
+  "select",
+  "option",
+  "code",
+  "pre",
+  "svg",
+  "nav",
+  "footer",
+  "[hidden]",
+  "[inert]",
+  "[aria-hidden='true']",
+  "[style*='display: none']",
+  "[style*='display:none']",
+  "[style*='visibility: hidden']",
+  "[style*='visibility:hidden']"
+].join(", ");
+
+const CONTENT_BLOCK_SELECTOR = "p, li, blockquote, h1, h2, h3";
+
 function isExcluded(element: Element): boolean {
-  return Boolean(element.closest("script, style, noscript, textarea, input, select, option, code, pre, svg, nav, footer, [aria-hidden='true']"));
+  return Boolean(element.closest(EXCLUDED_CONTENT_SELECTOR));
 }
 
 function primaryContentRoot(): Element {
   return document.querySelector("article, main, [role='main']") ?? document.body;
+}
+
+function pageIdentityUrl(): string {
+  const url = new URL(location.href);
+  url.hash = "";
+  return url.href;
 }
 
 async function digest(value: string): Promise<string> {
@@ -269,46 +328,53 @@ async function digest(value: string): Promise<string> {
   return [...new Uint8Array(hash)].slice(0, 10).map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function collectPageContext(): Promise<PageContext | null> {
-  const contentRoot = primaryContentRoot();
-  const outline = [...contentRoot.querySelectorAll("h1, h2, h3")]
-    .filter((element) => !isExcluded(element))
-    .map((element) => normalizeText(element.textContent ?? ""))
-    .filter((text) => text.length >= 2)
-    .slice(0, 24);
-
-  const candidates = [...contentRoot.querySelectorAll("p, li, blockquote, h1, h2, h3")]
-    .filter((element) => !isExcluded(element))
-    .filter((element) => {
-      const style = getComputedStyle(element);
-      return style.display !== "none" && style.visibility !== "hidden";
-    });
-
+async function collectPageContext(contentRoot: Element): Promise<PageContext | null> {
+  const outline: string[] = [];
   const blocks: PageBlock[] = [];
+  const seenBlockText = new Set<string>();
   let chars = 0;
-  let currentHeading = outline[0] ?? document.title;
-  for (const element of candidates) {
+  let currentHeading = normalizeText(document.title);
+  const walker = document.createTreeWalker(contentRoot, NodeFilter.SHOW_ELEMENT, {
+    acceptNode(node) {
+      const element = node as Element;
+      if (element.matches(EXCLUDED_CONTENT_SELECTOR)) return NodeFilter.FILTER_REJECT;
+      return element.matches(CONTENT_BLOCK_SELECTOR) && !element.querySelector(CONTENT_BLOCK_SELECTOR)
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_SKIP;
+    }
+  });
+
+  let node = walker.nextNode();
+  while (node) {
+    const element = node as Element;
     const text = normalizeText(element.textContent ?? "");
     if (/^H[1-3]$/.test(element.tagName)) {
-      if (text) currentHeading = text;
+      if (text.length >= 2) {
+        currentHeading = text;
+        if (outline.length < 24) outline.push(text);
+      }
+      node = walker.nextNode();
       continue;
     }
-    if (text.length < 24 || text.length > 2_500) continue;
-    if (blocks.some((block) => block.text === text)) continue;
-    if (chars + text.length > MAX_PAGE_CHARS) break;
-    blocks.push({ index: blocks.length, text, heading: currentHeading });
-    chars += text.length;
+    if (text.length >= 24 && text.length <= 2_500 && !seenBlockText.has(text)) {
+      if (chars + text.length > MAX_PAGE_CHARS) break;
+      seenBlockText.add(text);
+      blocks.push({ index: blocks.length, text, heading: currentHeading });
+      chars += text.length;
+    }
+    node = walker.nextNode();
   }
 
   if (chars < 500 || blocks.length < 3) return null;
   const fullText = blocks.map((block) => `[${block.heading}]\n${block.text}`).join("\n\n");
+  const url = pageIdentityUrl();
   return {
-    url: location.href,
+    url,
     title: normalizeText(document.title),
     outline,
     blocks,
     fullText,
-    hash: await digest(`${location.href}\n${fullText}`)
+    hash: await digest(`${url}\n${fullText}`)
   };
 }
 
@@ -324,8 +390,10 @@ function setSummaryStatus(status: SummaryStatus, detail?: string) {
 function renderSummary() {
   summaryContent.classList.remove("loading");
   if (!summary) {
-    summaryContent.classList.add("loading");
-    summaryContent.textContent = summaryStatus === "error" ? "このページでは要約を作れませんでした" : "ページ全体を読んでいます";
+    if (summaryStatus === "reading") summaryContent.classList.add("loading");
+    summaryContent.textContent = summaryStatus === "error"
+      ? summaryErrorMessage || "このページでは要約を作れませんでした"
+      : summaryLoadingMessage;
     return;
   }
   const lines = summary.split(/\r?\n/).map(normalizeText).filter(Boolean).slice(0, 3);
@@ -339,13 +407,53 @@ function renderSummary() {
   summaryContent.replaceChildren(list);
 }
 
+function setSummaryLoadingMessage(message: string) {
+  summaryLoadingMessage = message;
+  if (summaryStatus === "reading" && !summary) renderSummary();
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+  onTimeout?: () => void
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timeout = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onTimeout?.();
+      reject(new Error(message));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        reject(error);
+      }
+    );
+  });
+}
+
 async function getModel(): Promise<LanguageModel> {
   if (modelPromise) return modelPromise;
   modelPromise = (async () => {
     if (!("LanguageModel" in globalThis)) throw new Error("Prompt APIに対応したChromeが必要です");
-    const availability = await LanguageModel.availability(AI_OPTIONS);
+    const availability = await withTimeout(
+      LanguageModel.availability(AI_OPTIONS),
+      MODEL_AVAILABILITY_TIMEOUT_MS,
+      "ローカルAIの利用確認がタイムアウトしました。"
+    );
     if (availability === "unavailable") throw new Error("この端末ではローカルAIを利用できません");
-    return LanguageModel.create({
+    const creation = LanguageModel.create({
       ...AI_OPTIONS,
       initialPrompts: [{
         role: "system",
@@ -353,22 +461,99 @@ async function getModel(): Promise<LanguageModel> {
       }],
       monitor(monitor) {
         monitor.addEventListener("downloadprogress", (event) => {
-          setSummaryStatus("reading", `${Math.max(1, Math.round(event.loaded * 100))}%`);
+          const progress = Math.max(1, Math.round(event.loaded * 100));
+          setSummaryStatus("reading", `${progress}%`);
+          if (!explanationPriority) setSummaryLoadingMessage(`ローカルAIを準備しています（${progress}%）`);
         });
       }
     });
+    let setupTimedOut = false;
+    try {
+      return await withTimeout(
+        creation,
+        MODEL_SETUP_TIMEOUT_MS,
+        "ローカルAIの準備が2分を超えたため中断しました。",
+        () => { setupTimedOut = true; }
+      );
+    } finally {
+      if (setupTimedOut) void creation.then((model) => model.destroy()).catch(() => undefined);
+    }
   })();
   try {
-    return await modelPromise;
+    const model = await modelPromise;
+    modelReady = true;
+    return model;
   } catch (error) {
     modelPromise = null;
+    modelReady = false;
     throw error;
+  }
+}
+
+async function getSummarizer(): Promise<Summarizer> {
+  if (summarizerPromise) return summarizerPromise;
+  summarizerPromise = (async () => {
+    if (!("Summarizer" in globalThis)) throw new Error("Summarizer APIに対応したChromeが必要です");
+    const availability = await withTimeout(
+      Summarizer.availability(SUMMARIZER_OPTIONS),
+      MODEL_AVAILABILITY_TIMEOUT_MS,
+      "要約AIの利用確認がタイムアウトしました。"
+    );
+    if (availability === "unavailable") throw new Error("この端末ではSummarizer APIを利用できません");
+    const creation = Summarizer.create({
+      ...SUMMARIZER_OPTIONS,
+      sharedContext: "Summarize webpage excerpts faithfully. Preserve important names, numbers, claims, and uncertainty.",
+      monitor(monitor) {
+        monitor.addEventListener("downloadprogress", (event) => {
+          const progress = Math.max(1, Math.round(event.loaded * 100));
+          setSummaryStatus("reading", `${progress}%`);
+          setSummaryLoadingMessage(`要約AIを準備しています（${progress}%）`);
+        });
+      }
+    });
+    let setupTimedOut = false;
+    try {
+      return await withTimeout(
+        creation,
+        MODEL_SETUP_TIMEOUT_MS,
+        "要約AIの準備が2分を超えたため中断しました。",
+        () => { setupTimedOut = true; }
+      );
+    } finally {
+      if (setupTimedOut) void creation.then((summarizer) => summarizer.destroy()).catch(() => undefined);
+    }
+  })();
+  try {
+    const summarizer = await summarizerPromise;
+    summarizerReady = true;
+    return summarizer;
+  } catch (error) {
+    summarizerPromise = null;
+    summarizerReady = false;
+    throw error;
+  }
+}
+
+async function runSummarizer(input: string, context: string): Promise<string> {
+  const summarizer = await getSummarizer();
+  const controller = new AbortController();
+  activePromptController = controller;
+  try {
+    return await withTimeout(
+      summarizer.summarize(input, { context, signal: controller.signal }),
+      MODEL_TIMEOUT_MS,
+      "要約AIの応答が90秒を超えたため中断しました。",
+      () => controller.abort()
+    );
+  } finally {
+    if (activePromptController === controller) activePromptController = null;
   }
 }
 
 async function destroyModelSession() {
   const pendingModel = modelPromise;
   modelPromise = null;
+  modelReady = false;
   if (!pendingModel) return;
   try {
     const model = await pendingModel;
@@ -383,6 +568,11 @@ function isAbortError(error: unknown): boolean {
     || error instanceof Error && /abort/i.test(error.message);
 }
 
+function isQuotaExceededError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "QuotaExceededError"
+    || error instanceof Error && /quotaexceeded|input is too large|context window/i.test(`${error.name} ${error.message}`);
+}
+
 function isTransientModelError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return /kErrorUnknown|unknown error|invalidstateerror|invalid state|session (?:was )?(?:closed|destroyed)/i.test(
@@ -392,23 +582,46 @@ function isTransientModelError(error: unknown): boolean {
 
 async function promptModelOnce(
   prompt: string,
-  options: { responseConstraint?: Record<string, unknown> } = {}
+  options: ModelPromptOptions = {}
 ): Promise<string> {
-  const model = await getModel();
+  const baseModel = await getModel();
   const controller = new AbortController();
   activePromptController = controller;
-  const timeout = window.setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS);
+  let model: LanguageModel | null = null;
   try {
-    return await model.prompt(prompt, { ...options, signal: controller.signal });
+    const cloning = baseModel.clone({ signal: controller.signal });
+    let cloneTimedOut = false;
+    try {
+      model = await withTimeout(
+        cloning,
+        MODEL_CLONE_TIMEOUT_MS,
+        "ローカルAIセッションの準備がタイムアウトしました。",
+        () => {
+          cloneTimedOut = true;
+          controller.abort();
+        }
+      );
+    } finally {
+      if (cloneTimedOut) void cloning.then((session) => session.destroy()).catch(() => undefined);
+    }
+    const result = await withTimeout(
+      model.prompt(prompt, { ...options, signal: controller.signal }),
+      MODEL_TIMEOUT_MS,
+      "ローカルAIの応答が90秒を超えたため中断しました。",
+      () => {
+        controller.abort();
+      }
+    );
+    return result;
   } finally {
-    window.clearTimeout(timeout);
+    model?.destroy();
     if (activePromptController === controller) activePromptController = null;
   }
 }
 
 async function promptModel(
   prompt: string,
-  options: { responseConstraint?: Record<string, unknown> } = {}
+  options: ModelPromptOptions = {}
 ): Promise<string> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
@@ -437,16 +650,43 @@ async function storeSummary(context: PageContext, value: string) {
   await chrome.storage.local.set({ [SUMMARY_CACHE_KEY]: Object.fromEntries(entries) });
 }
 
-function summaryPrompt(context: PageContext): string {
+function evenlySpacedBlocks(blocks: PageBlock[], count: number): PageBlock[] {
+  if (count >= blocks.length) return blocks;
+  if (count <= 1) return [blocks[Math.floor((blocks.length - 1) / 2)]];
+  const indices = new Set<number>();
+  for (let index = 0; index < count; index += 1) {
+    indices.add(Math.round(index * (blocks.length - 1) / (count - 1)));
+  }
+  return [...indices].sort((a, b) => a - b).map((index) => blocks[index]);
+}
+
+function summaryBlocksWithinCharLimit(blocks: PageBlock[]): PageBlock[] {
+  const totalChars = blocks.reduce((total, block) => total + block.text.length, 0);
+  if (totalChars <= MAX_SUMMARY_CHARS) return blocks;
+  for (let count = blocks.length - 1; count >= 1; count -= 1) {
+    const candidate = evenlySpacedBlocks(blocks, count);
+    const chars = candidate.reduce((total, block) => total + block.text.length, 0);
+    if (chars <= MAX_SUMMARY_CHARS) return candidate;
+  }
+  return evenlySpacedBlocks(blocks, 1);
+}
+
+function summaryPageText(blocks: PageBlock[]): string {
+  return blocks.map((block) => `[${block.heading}]\n${block.text}`).join("\n\n");
+}
+
+function summaryPrompt(context: PageContext, blocks: PageBlock[] = context.blocks): string {
+  const pageText = summaryPageText(blocks);
   return [
     languageRequirement(),
     `Page title: ${context.title}`,
     `Headings: ${context.outline.join(" / ")}`,
-    "Read the complete page text below and create a factual summary.",
-    "Return exactly three concise, non-empty summary strings in the required response schema.",
+    "Read the supplied excerpts from across the page and create a factual summary.",
+    'Return only a JSON object shaped as {"summary":["first point","second point","third point"]}.',
+    "The summary array must contain exactly three concise, non-empty strings.",
     "Each line should add a different important point and preserve important names and numbers.",
-    "Complete page text:",
-    context.fullText
+    "Page excerpts:",
+    pageText
   ].join("\n\n");
 }
 
@@ -463,6 +703,108 @@ const summarySchema = {
   required: ["summary"],
   additionalProperties: false
 };
+
+const summaryPromptOptions: ModelPromptOptions = {
+  responseConstraint: summarySchema,
+  omitResponseConstraintInput: true
+};
+
+async function fitSummaryPrompt(
+  context: PageContext,
+  model: LanguageModel,
+  usageRatio: number
+): Promise<{ prompt: string; blocksUsed: number; usage: number | null }> {
+  const summaryBlocks = summaryBlocksWithinCharLimit(context.blocks);
+  const contextWindow = Number.isFinite(model.contextWindow) ? model.contextWindow : model.inputQuota;
+  const contextUsage = Number.isFinite(model.contextUsage) ? model.contextUsage : model.inputUsage;
+  const available = contextWindow - contextUsage;
+  const budget = Number.isFinite(available) ? Math.max(1, available * usageRatio) : Infinity;
+  const measureContextUsage = typeof model.measureContextUsage === "function"
+    ? model.measureContextUsage.bind(model)
+    : model.measureInputUsage.bind(model);
+  const measure = async (blocks: PageBlock[]) => {
+    const prompt = summaryPrompt(context, blocks);
+    const usage = await withTimeout(
+      measureContextUsage(prompt, summaryPromptOptions),
+      CONTEXT_USAGE_TIMEOUT_MS,
+      "ローカルAIの入力サイズ計測がタイムアウトしました。"
+    );
+    return { prompt, usage, blocksUsed: blocks.length };
+  };
+
+  try {
+    const full = await measure(summaryBlocks);
+    if (full.usage <= budget) return full;
+
+    let low = 1;
+    let high = summaryBlocks.length - 1;
+    let best = await measure(evenlySpacedBlocks(summaryBlocks, low));
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = await measure(evenlySpacedBlocks(summaryBlocks, middle));
+      if (candidate.usage <= budget) {
+        best = candidate;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    console.info(
+      `ことばレンズ: 入力上限に合わせて本文を${context.blocks.length}段落から${best.blocksUsed}段落へ圧縮しました`
+    );
+    return best;
+  } catch (error) {
+    console.warn("ことばレンズ: 入力サイズを計測できなかったため文字数上限を使います", error);
+    return { prompt: summaryPrompt(context, summaryBlocks), blocksUsed: summaryBlocks.length, usage: null };
+  }
+}
+
+function summarizerContext(context: PageContext): string {
+  return `Page title: ${context.title}\nPage headings: ${context.outline.join(" / ")}`;
+}
+
+async function fitSummarizerInput(
+  context: PageContext,
+  summarizer: Summarizer,
+  usageRatio: number
+): Promise<{ input: string; blocksUsed: number; usage: number | null }> {
+  const summaryBlocks = summaryBlocksWithinCharLimit(context.blocks);
+  const summaryContext = summarizerContext(context);
+  const budget = Number.isFinite(summarizer.inputQuota)
+    ? Math.max(1, summarizer.inputQuota * usageRatio)
+    : Infinity;
+  const measure = async (blocks: PageBlock[]) => {
+    const input = summaryPageText(blocks);
+    const usage = await withTimeout(
+      summarizer.measureInputUsage(input, { context: summaryContext }),
+      CONTEXT_USAGE_TIMEOUT_MS,
+      "要約AIの入力サイズ計測がタイムアウトしました。"
+    );
+    return { input, usage, blocksUsed: blocks.length };
+  };
+
+  try {
+    const full = await measure(summaryBlocks);
+    if (full.usage <= budget) return full;
+    let low = 1;
+    let high = summaryBlocks.length - 1;
+    let best = await measure(evenlySpacedBlocks(summaryBlocks, low));
+    while (low <= high) {
+      const middle = Math.floor((low + high) / 2);
+      const candidate = await measure(evenlySpacedBlocks(summaryBlocks, middle));
+      if (candidate.usage <= budget) {
+        best = candidate;
+        low = middle + 1;
+      } else {
+        high = middle - 1;
+      }
+    }
+    return best;
+  } catch (error) {
+    console.warn("ことばレンズ: Summarizer APIの入力サイズを計測できなかったため文字数上限を使います", error);
+    return { input: summaryPageText(summaryBlocks), blocksUsed: summaryBlocks.length, usage: null };
+  }
+}
 
 function summaryLinesFromParsed(value: unknown): string[] {
   if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
@@ -505,6 +847,16 @@ function normalizeSummaryResponse(value: string): string {
   return cleaned.join("\n");
 }
 
+function normalizeSummarizerResponse(value: string): string {
+  const lines = value
+    .split(/\r?\n/)
+    .map(cleanSummaryLine)
+    .filter(Boolean)
+    .slice(0, 3);
+  if (!lines.length) throw new Error("要約AIから要約を取得できませんでした。");
+  return lines.join("\n");
+}
+
 function languageRequirement(): string {
   return `Output language requirement: the user's preferred language is BCP-47 \"${PREFERRED_LANGUAGE}\". Write every sentence and every JSON string value in this language. The webpage language does not override this requirement.`;
 }
@@ -536,11 +888,67 @@ function revealSummaryWhenAppropriate() {
   }
 }
 
+function contextIsCurrent(context: PageContext): boolean {
+  return !navigationDirty && pageIdentityUrl() === context.url && pageContext?.hash === context.hash;
+}
+
+async function summarizePageWithSummarizer(context: PageContext): Promise<string> {
+  setSummaryLoadingMessage(summarizerReady ? "ページ全体を読んでいます" : "要約AIを準備しています");
+  const summarizer = await getSummarizer();
+  if (!contextIsCurrent(context)) return "";
+  setSummaryLoadingMessage("ページ全体を読んでいます");
+  let fitted = await fitSummarizerInput(context, summarizer, SUMMARY_CONTEXT_RATIO);
+  let response: string;
+  try {
+    response = await runSummarizer(fitted.input, summarizerContext(context));
+  } catch (error) {
+    if (!isQuotaExceededError(error)) throw error;
+    console.warn("ことばレンズ: Summarizer APIの入力上限を超えたため、本文をさらに圧縮して再試行します", error);
+    fitted = await fitSummarizerInput(context, summarizer, SUMMARY_RETRY_CONTEXT_RATIO);
+    response = await runSummarizer(fitted.input, summarizerContext(context));
+  }
+  setSummaryLoadingMessage("要約を仕上げています");
+  const result = await localizeSummaryIfNeeded(normalizeSummarizerResponse(response));
+  console.info("ことばレンズ: Summarizer APIで要約しました");
+  return result;
+}
+
+async function summarizePageWithPrompt(context: PageContext): Promise<string> {
+  setSummaryLoadingMessage(modelReady ? "ページ全体を読んでいます" : "ローカルAIを準備しています");
+  let model = await getModel();
+  if (!contextIsCurrent(context)) return "";
+  setSummaryLoadingMessage("ページ全体を読んでいます");
+  let fitted = await fitSummaryPrompt(context, model, SUMMARY_CONTEXT_RATIO);
+  let response: string;
+  try {
+    response = await promptModel(fitted.prompt, summaryPromptOptions);
+  } catch (error) {
+    if (!isQuotaExceededError(error)) throw error;
+    console.warn("ことばレンズ: 入力上限を超えたため、本文をさらに圧縮して再試行します", error);
+    model = await getModel();
+    fitted = await fitSummaryPrompt(context, model, SUMMARY_RETRY_CONTEXT_RATIO);
+    response = await promptModel(fitted.prompt, summaryPromptOptions);
+  }
+  setSummaryLoadingMessage("要約を仕上げています");
+  return localizeSummaryIfNeeded(normalizeSummaryResponse(response));
+}
+
 async function generateSummaryInternal(context: PageContext) {
+  summaryErrorMessage = "";
   setSummaryStatus("reading");
-  renderSummary();
-  const cached = await getCachedSummary(context);
+  setSummaryLoadingMessage("要約キャッシュを確認しています");
+  let cached = "";
+  try {
+    cached = await withTimeout(
+      getCachedSummary(context),
+      STORAGE_TIMEOUT_MS,
+      "要約キャッシュの確認がタイムアウトしました。"
+    );
+  } catch (error) {
+    console.warn("ことばレンズ: 要約キャッシュを読み込めなかったため生成を続けます", error);
+  }
   if (cached) {
+    if (!contextIsCurrent(context)) return;
     summary = cached;
     setSummaryStatus("ready");
     renderSummary();
@@ -549,18 +957,26 @@ async function generateSummaryInternal(context: PageContext) {
   }
 
   try {
-    const response = await promptModel(summaryPrompt(context), { responseConstraint: summarySchema });
-    const result = await localizeSummaryIfNeeded(normalizeSummaryResponse(response));
-    if (pageContext?.hash !== context.hash || !result) return;
+    let result: string;
+    try {
+      result = await summarizePageWithSummarizer(context);
+    } catch (error) {
+      if ((explanationPriority || navigationDirty) && isAbortError(error)) throw error;
+      console.warn("ことばレンズ: Summarizer APIで要約できなかったためPrompt APIへ切り替えます", error);
+      result = await summarizePageWithPrompt(context);
+    }
+    if (!contextIsCurrent(context) || !result) return;
     summary = result;
-    await storeSummary(context, summary);
     setSummaryStatus("ready");
     renderSummary();
     revealSummaryWhenAppropriate();
+    void storeSummary(context, result).catch((error) => {
+      console.warn("ことばレンズ: 要約キャッシュの保存に失敗しました", error);
+    });
   } catch (error) {
-    if (explanationPriority && error instanceof DOMException && error.name === "AbortError") return;
-    if (explanationPriority && error instanceof Error && /abort/i.test(error.message)) return;
+    if ((explanationPriority || navigationDirty) && isAbortError(error)) return;
     console.warn("ことばレンズ: 要約に失敗しました", error);
+    summaryErrorMessage = explanationErrorMessage(error, "このページでは要約を作れませんでした。もう一度お試しください。");
     setSummaryStatus("error");
     renderSummary();
   }
@@ -569,7 +985,10 @@ async function generateSummaryInternal(context: PageContext) {
 function startSummary() {
   if (!pageContext || summaryPromise || summaryStatus === "ready") return;
   const context = pageContext;
-  summaryPromise = generateSummaryInternal(context).finally(() => { summaryPromise = null; });
+  summaryPromise = generateSummaryInternal(context).finally(() => {
+    summaryPromise = null;
+    if (contextDirty) scheduleContextRefresh();
+  });
 }
 
 function tokensOf(text: string): string[] {
@@ -663,10 +1082,8 @@ async function explainSelection() {
   explanationActions.hidden = true;
 
   explanationPriority = true;
-  const interruptedModelWork = activePromptController !== null || summaryPromise !== null;
   activePromptController?.abort();
   if (summaryPromise) await summaryPromise.catch(() => undefined);
-  if (interruptedModelWork) await destroyModelSession();
 
   try {
     const result = await promptModel([
@@ -691,10 +1108,11 @@ async function explainSelection() {
     );
   } finally {
     explanationPriority = false;
-    if (!summary && summaryStatus !== "ready") {
+    if (!navigationDirty && !summary && summaryStatus !== "ready") {
       setSummaryStatus("reading");
       startSummary();
     }
+    if (contextDirty) scheduleContextRefresh();
   }
 }
 
@@ -727,6 +1145,8 @@ async function refineExplanation(mode: ExplanationMode) {
       "説明を書き換えられませんでした。もう一度お試しください。"
     );
     explanationActions.hidden = false;
+  } finally {
+    if (contextDirty) scheduleContextRefresh();
   }
 }
 
@@ -768,7 +1188,12 @@ function scheduleSelectionUpdate() {
 }
 
 async function refreshContext() {
-  const next = await collectPageContext();
+  window.clearTimeout(contextRefreshTimer);
+  contextDirty = false;
+  navigationDirty = false;
+  const contentRoot = primaryContentRoot();
+  observeContentRoot(contentRoot);
+  const next = await collectPageContext(contentRoot);
   if (!next) {
     host.hidden = true;
     return;
@@ -780,6 +1205,8 @@ async function refreshContext() {
   pageContext = next;
   summary = "";
   summaryStatus = "reading";
+  summaryLoadingMessage = "ページ全体を読んでいます";
+  summaryErrorMessage = "";
   currentExplanation = null;
   setSummaryStatus("reading");
   renderSummary();
@@ -787,8 +1214,92 @@ async function refreshContext() {
 }
 
 function scheduleContextRefresh() {
+  contextDirty = true;
+  if (summaryPromise || activePromptController) return;
   window.clearTimeout(contextRefreshTimer);
-  contextRefreshTimer = window.setTimeout(() => void refreshContext(), 2_500);
+  contextRefreshTimer = window.setTimeout(() => {
+    contextRefreshTimer = 0;
+    if (summaryPromise || activePromptController) return;
+    void refreshContext();
+  }, navigationDirty ? 250 : 2_500);
+}
+
+function scheduleNavigationRefresh() {
+  if (pageContext?.url === pageIdentityUrl() && observedContentRoot?.isConnected) return;
+  navigationDirty = true;
+  contextDirty = true;
+  summary = "";
+  summaryStatus = "reading";
+  summaryLoadingMessage = "ページ全体を読んでいます";
+  summaryErrorMessage = "";
+  currentExplanation = null;
+  setSummaryStatus("reading");
+  renderSummary();
+  activePromptController?.abort();
+  scheduleContextRefresh();
+}
+
+function mutationElement(node: Node): Element | null {
+  return node instanceof Element ? node : node.parentElement;
+}
+
+function containsContentBlock(node: Node): boolean {
+  const element = mutationElement(node);
+  if (!element || isExcluded(element)) return false;
+  return element.matches(CONTENT_BLOCK_SELECTOR) || Boolean(element.querySelector(CONTENT_BLOCK_SELECTOR));
+}
+
+function isRelevantContentMutation(record: MutationRecord): boolean {
+  const target = mutationElement(record.target);
+  if (!target || isExcluded(target)) return false;
+  if (record.type === "characterData") return Boolean(target.closest(CONTENT_BLOCK_SELECTOR));
+  if (target.closest(CONTENT_BLOCK_SELECTOR)) return true;
+  return [...record.addedNodes, ...record.removedNodes].some(containsContentBlock);
+}
+
+const contentObserver = new MutationObserver((records) => {
+  if (records.some(isRelevantContentMutation)) scheduleContextRefresh();
+});
+
+const rootReplacementObserver = new MutationObserver((records) => {
+  if (!observedContentRoot?.isConnected || records.some((record) =>
+    [...record.addedNodes].some((node) => {
+      const element = mutationElement(node);
+      return Boolean(
+        element?.matches("article, main, [role='main']")
+        || element?.querySelector("article, main, [role='main']")
+      );
+    })
+  )) {
+    scheduleContextRefresh();
+  }
+});
+
+const navigationObserver = new MutationObserver(() => {
+  if (pageContext && pageIdentityUrl() !== pageContext.url) {
+    scheduleNavigationRefresh();
+  } else if (observedContentRoot && !observedContentRoot.isConnected) {
+    scheduleContextRefresh();
+  }
+});
+
+function observeContentRoot(contentRoot: Element) {
+  if (observedContentRoot === contentRoot) return;
+  contentObserver.disconnect();
+  rootReplacementObserver.disconnect();
+  observedContentRoot = contentRoot;
+  contentObserver.observe(contentRoot, { childList: true, characterData: true, subtree: true });
+  if (contentRoot !== document.body && contentRoot.parentElement) {
+    rootReplacementObserver.observe(contentRoot.parentElement, { childList: true });
+  }
+}
+
+function retrySummaryIfNeeded() {
+  if (summaryStatus !== "error" || summaryPromise) return;
+  summaryErrorMessage = "";
+  setSummaryStatus("reading");
+  setSummaryLoadingMessage(summarizerReady ? "ページ全体を読んでいます" : "要約AIを準備しています");
+  startSummary();
 }
 
 summaryTrigger.addEventListener("click", () => {
@@ -796,6 +1307,7 @@ summaryTrigger.addEventListener("click", () => {
   if (willOpen) {
     explanationCard.hidden = true;
     hideSelectionAction();
+    retrySummaryIfNeeded();
   }
   summaryCard.hidden = !willOpen;
   renderSummary();
@@ -815,6 +1327,8 @@ root.addEventListener("click", (event) => {
 document.addEventListener("selectionchange", scheduleSelectionUpdate);
 window.addEventListener("scroll", hideSelectionAction, { passive: true });
 window.addEventListener("resize", hideSelectionAction, { passive: true });
+window.addEventListener("popstate", scheduleNavigationRefresh);
+window.addEventListener("hashchange", scheduleNavigationRefresh);
 
 chrome.runtime.onMessage.addListener((message: unknown) => {
   if ((message as { type?: string })?.type !== "KOTOBA_LENS_TOGGLE_SUMMARY") return;
@@ -822,17 +1336,12 @@ chrome.runtime.onMessage.addListener((message: unknown) => {
   if (willOpen) {
     explanationCard.hidden = true;
     hideSelectionAction();
+    retrySummaryIfNeeded();
   }
   summaryCard.hidden = !willOpen;
   renderSummary();
 });
 
-const observer = new MutationObserver((records) => {
-  if (records.some((record) => record.addedNodes.length || record.removedNodes.length || record.type === "characterData")) {
-    scheduleContextRefresh();
-  }
-});
-observer.observe(document.body, { childList: true, characterData: true, subtree: true });
-
 const begin = () => void refreshContext();
-window.requestIdleCallback(begin, { timeout: 1_200 });
+navigationObserver.observe(document.body, { childList: true, subtree: true });
+window.requestIdleCallback(begin, { timeout: 200 });
