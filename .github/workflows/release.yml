@@ -6,7 +6,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -30,7 +29,9 @@ jobs:
           title: "chore: release"
           commit: "chore: release"
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A user token is required because the repository does not allow the
+          # workflow-provided GITHUB_TOKEN to create pull requests.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
       - name: Build release artifact
         if: steps.changesets.outputs.published == 'true'
         run: npm run package
