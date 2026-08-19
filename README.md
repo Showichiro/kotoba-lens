@@ -81,6 +81,10 @@ Chrome の組み込み AI の要件と API は [Prompt API 公式ドキュメン
 - 初回実行時はモデルのダウンロードに時間がかかる場合があります。
 - ローカルモデルがChromeのUI言語をサポートしていない場合、その言語では生成できません。
 
+## リリース自動化の設定
+
+リリースワークフローには `RELEASE_TOKEN` という Repository Secret が必要です。このリポジトリに対する **Contents: Read and write** と **Pull requests: Read and write** の権限を持つ Fine-grained personal access token を設定してください。Changesets はこのトークンを使ってリリース PR を作成・更新します。Repository の “Allow GitHub Actions to create and approve pull requests” が無効な場合、ワークフローに自動発行される `GITHUB_TOKEN` ではリリース PR を作成できません。
+
 ## License
 
 [Apache License 2.0](LICENSE) © 2026 Showichiro
