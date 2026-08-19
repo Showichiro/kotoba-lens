@@ -338,7 +338,7 @@ async function collectPageContext(contentRoot: Element): Promise<PageContext | n
     acceptNode(node) {
       const element = node as Element;
       if (element.matches(EXCLUDED_CONTENT_SELECTOR)) return NodeFilter.FILTER_REJECT;
-      return element.matches(CONTENT_BLOCK_SELECTOR)
+      return element.matches(CONTENT_BLOCK_SELECTOR) && !element.querySelector(CONTENT_BLOCK_SELECTOR)
         ? NodeFilter.FILTER_ACCEPT
         : NodeFilter.FILTER_SKIP;
     }
@@ -589,14 +589,21 @@ async function promptModelOnce(
   activePromptController = controller;
   let model: LanguageModel | null = null;
   try {
-    model = await withTimeout(
-      baseModel.clone({ signal: controller.signal }),
-      MODEL_CLONE_TIMEOUT_MS,
-      "ローカルAIセッションの準備がタイムアウトしました。",
-      () => {
-        controller.abort();
-      }
-    );
+    const cloning = baseModel.clone({ signal: controller.signal });
+    let cloneTimedOut = false;
+    try {
+      model = await withTimeout(
+        cloning,
+        MODEL_CLONE_TIMEOUT_MS,
+        "ローカルAIセッションの準備がタイムアウトしました。",
+        () => {
+          cloneTimedOut = true;
+          controller.abort();
+        }
+      );
+    } finally {
+      if (cloneTimedOut) void cloning.then((session) => session.destroy()).catch(() => undefined);
+    }
     const result = await withTimeout(
       model.prompt(prompt, { ...options, signal: controller.signal }),
       MODEL_TIMEOUT_MS,
@@ -840,6 +847,16 @@ function normalizeSummaryResponse(value: string): string {
   return cleaned.join("\n");
 }
 
+function normalizeSummarizerResponse(value: string): string {
+  const lines = value
+    .split(/\r?\n/)
+    .map(cleanSummaryLine)
+    .filter(Boolean)
+    .slice(0, 3);
+  if (!lines.length) throw new Error("要約AIから要約を取得できませんでした。");
+  return lines.join("\n");
+}
+
 function languageRequirement(): string {
   return `Output language requirement: the user's preferred language is BCP-47 \"${PREFERRED_LANGUAGE}\". Write every sentence and every JSON string value in this language. The webpage language does not override this requirement.`;
 }
@@ -891,7 +908,7 @@ async function summarizePageWithSummarizer(context: PageContext): Promise<string
     response = await runSummarizer(fitted.input, summarizerContext(context));
   }
   setSummaryLoadingMessage("要約を仕上げています");
-  const result = await localizeSummaryIfNeeded(normalizeSummaryResponse(response));
+  const result = await localizeSummaryIfNeeded(normalizeSummarizerResponse(response));
   console.info("ことばレンズ: Summarizer APIで要約しました");
   return result;
 }
