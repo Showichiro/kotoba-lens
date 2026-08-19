@@ -19,6 +19,14 @@ Chrome 内蔵のローカル LLM（Prompt API / Gemini Nano）がページ全体
 - Prompt API のハードウェア／ストレージ要件を満たす端末
 - Node.js 20 以降
 
+### ビルド済みファイルを使う
+
+[Releases](https://github.com/Showichiro/kotoba-lens/releases/latest) から最新の `kotoba-lens-v*.zip` をダウンロードして展開し、Chrome の `chrome://extensions` でデベロッパーモードを有効にして「パッケージ化されていない拡張機能を読み込む」から展開先を選びます。
+
+リリース前の最新版は [Actions の CI](https://github.com/Showichiro/kotoba-lens/actions/workflows/ci.yml) の成功した実行にある Artifacts からダウンロードできます（GitHubへのログインが必要です）。
+
+### ソースからビルドする
+
 ```sh
 npm install
 npm run build
@@ -36,6 +44,22 @@ npm run dev
 ```
 
 `dev` はファイル変更を監視して `dist` を再生成します。変更後は `chrome://extensions` で拡張を再読み込みしてください。
+
+配布用の ZIP は次のコマンドで `artifacts/` に生成できます。
+
+```sh
+npm run package
+```
+
+## リリースと Changelog
+
+利用者に影響する変更には Changeset を追加します。
+
+```sh
+npm run changeset
+```
+
+`main` への反映後、Changesets Action がリリース PR を作成・更新します。この PR をマージすると `CHANGELOG.md` とバージョンを更新し、GitHub Release にインストール用 ZIP を添付します。変更の分類は SemVer に従い、修正は patch、後方互換性のある機能追加は minor、破壊的変更は major を選択してください。
 
 ## プライバシーと権限
 
