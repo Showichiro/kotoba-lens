@@ -19,9 +19,9 @@
     "check": "tsc --noEmit",
     "dev": "node build.mjs --watch",
     "package": "npm run build && node scripts/package.mjs",
-    "changeset": "npx --yes @changesets/cli@2.29.7",
-    "version": "npx --yes @changesets/cli@2.29.7 version",
-    "release": "npx --yes @changesets/cli@2.29.7 publish"
+    "changeset": "npx --yes @changesets/cli@latest",
+    "version": "npx --yes @changesets/cli@latest version",
+    "release": "npx --yes @changesets/cli@latest publish"
   },
   "devDependencies": {
     "@types/chrome": "^0.1.2",
