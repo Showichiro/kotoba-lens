@@ -1,5 +1,5 @@
 import { build, context } from "esbuild";
-import { cp, mkdir, rm } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 
 const watch = process.argv.includes("--watch");
 const staticFiles = ["manifest.json"];
@@ -7,6 +7,13 @@ const staticFiles = ["manifest.json"];
 async function copyStaticFiles() {
   await mkdir("dist", { recursive: true });
   await Promise.all(staticFiles.map((file) => cp(`src/${file}`, `dist/${file}`)));
+
+  const [packageJson, manifestJson] = await Promise.all([
+    readFile("package.json", "utf8").then(JSON.parse),
+    readFile("dist/manifest.json", "utf8").then(JSON.parse)
+  ]);
+  manifestJson.version = packageJson.version;
+  await writeFile("dist/manifest.json", `${JSON.stringify(manifestJson, null, 2)}\n`);
 }
 
 const options = {
