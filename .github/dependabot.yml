@@ -9,6 +9,8 @@ updates:
       time: "09:00"
       timezone: Asia/Tokyo
     open-pull-requests-limit: 5
+    reviewers:
+      - Showichiro
     commit-message:
       prefix: "chore(deps)"
     groups:
@@ -27,6 +29,8 @@ updates:
       time: "09:00"
       timezone: Asia/Tokyo
     open-pull-requests-limit: 5
+    reviewers:
+      - Showichiro
     commit-message:
       prefix: "chore(deps)"
     groups:
