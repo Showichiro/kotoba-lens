@@ -28,6 +28,6 @@
     "@types/chrome": "^0.2.6",
     "@types/dom-chromium-ai": "^0.0.17",
     "esbuild": "^0.28.2",
-    "typescript": "^5.9.0"
+    "typescript": "^7.0.2"
   }
 }
