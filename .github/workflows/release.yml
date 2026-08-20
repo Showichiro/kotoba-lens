@@ -24,7 +24,7 @@ jobs:
       - run: npm ci
       - name: Create release PR or GitHub release
         id: changesets
-        uses: changesets/action@v1
+        uses: changesets/action@8488615a623b1b9c987934bb89eae8af6a946ac1 # v2.1.1
         with:
           publish: npm run release
           title: "chore: release"
