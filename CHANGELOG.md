@@ -1,5 +1,11 @@
 # kotoba-lens
 
+## 0.3.0
+
+### Minor Changes
+
+- 7ebe664: GitHub Actions と GitHub Releases から、Chrome に読み込める ZIP アーティファクトをダウンロードできるようにしました。
+
 このファイルは [Changesets](https://github.com/changesets/changesets) によって管理されます。
 リリース前の変更は `.changeset` ディレクトリに記録し、リリース PR でバージョンとともに反映します。
 

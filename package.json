@@ -1,6 +1,6 @@
 {
   "name": "kotoba-lens",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "A contextual reading assistant powered by Chrome's on-device Prompt API.",
   "license": "Apache-2.0",
