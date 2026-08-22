@@ -1,0 +1,17 @@
+name: feature_flag_lifecycle_plugin
+description: Analyzer plugin that rejects expired declarative feature flags.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.0
+
+dependencies:
+  analysis_server_plugin: 0.3.20
+  analyzer: 14.1.0
+  analyzer_plugin: 0.14.14
+
+dev_dependencies:
+  analyzer_testing: 0.3.4
+  test: ^1.31.2
+  test_reflective_loader: ^0.4.0

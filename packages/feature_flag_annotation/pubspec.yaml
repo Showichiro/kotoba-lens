@@ -1,0 +1,8 @@
+name: feature_flag_annotation
+description: Declarative feature flag lifecycle metadata.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.10.0
+

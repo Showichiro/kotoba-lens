@@ -1,0 +1,8 @@
+name: feature_flags_expired
+publish_to: none
+environment:
+  sdk: ^3.10.0
+dependencies:
+  feature_flag_annotation:
+    path: ../../packages/feature_flag_annotation
+

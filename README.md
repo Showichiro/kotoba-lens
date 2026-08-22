@@ -45,6 +45,59 @@ npm run dev
 
 `dev` はファイル変更を監視して `dist` を再生成します。変更後は `chrome://extensions` で拡張を再読み込みしてください。
 
+## Feature Flag lifecycle PoC
+
+このリポジトリには、Dart 3.10 で正式導入された Analyzer Plugin API を使い、Feature Flag の撤去期限を静的解析で強制する最小 PoC も含まれます。拡張機能が Flag の値をどこから取得するか（Remote Config など）には関与せず、コード上のライフサイクルメタデータだけを検査します。
+
+### 設計
+
+`feature_flag_annotation` はアプリが依存する軽量なアノテーション、`feature_flag_lifecycle_plugin` は開発時だけ利用する Analyzer Plugin です。Flag は enum value に宣言します。
+
+```dart
+enum FeatureFlag {
+  @Flag(
+    expiresAt: '2026-08-01',
+    owner: 'checkout-team',
+  )
+  newCheckout,
+}
+```
+
+`expiresAt` は UTC のカレンダー日（`YYYY-MM-DD`）として扱い、その日の間は有効、翌日から期限切れです。`owner` は任意の運用メタデータで、現在のルール判定には使いません。期限切れの場合は enum value に error severity の `expired_feature_flag` を報告するため、通常の `dart analyze` が非 0 で終了します。
+
+Plugin は対象プロジェクトの `analysis_options.yaml` でローカルパスを指定して有効化します。
+
+```yaml
+plugins:
+  feature_flag_lifecycle_plugin:
+    path: ../../packages/feature_flag_lifecycle_plugin
+```
+
+### 実行と検証
+
+Dart 3.11 以降を用意し（Plugin API 自体は Dart 3.10 で導入）、リポジトリルートで次を実行します。
+
+```sh
+./scripts/verify-feature-flags.sh
+```
+
+スクリプトはルールの単体テスト、期限内 fixture の解析成功、期限切れ fixture の解析失敗と診断コード／メッセージを順に検証します。個別にも確認できます。
+
+```sh
+cd fixtures/feature_flags_valid && dart pub get && dart analyze
+cd fixtures/feature_flags_expired && dart pub get && dart analyze # exit 3
+```
+
+検証 fixture は日付に依存して不安定にならないよう、期限内を `2999-12-31`、期限切れを `2000-01-01` に固定しています。CI の `feature-flag-lifecycle` job も同じスクリプトを実行し、期待される解析失敗を捕捉するので main を常時赤くしません。
+
+### 方式選定
+
+- **採用:** Dart 公式の `analysis_server_plugin` / `analyzer` API。Dart 3.10 以降の `plugins` 設定で標準の `dart analyze` に診断を統合でき、IDE と CI が同じルールを利用できます。
+- **不採用:** 旧 `analyzer_plugin` の protocol server を手動実装する方式。現在の公式エントリポイントと登録 API が利用できるため、古い API への依存や isolate protocol の独自実装は不要です。
+- **不採用:** 独立した CLI でソースを正規表現検索する方式。Analyzer の AST を使う採用案に比べ、Dart 構文への追従性と `dart analyze` への統合で劣ります。
+
+PoC の最小スコープとして、`Flag` という名前のアノテーション、リテラルの `expiresAt`、enum value を対象にしています。日付形式エラー、owner 必須化、型解決による同名アノテーション除外は将来のルール候補です。
+
 配布用の ZIP は次のコマンドで `artifacts/` に生成できます。
 
 ```sh

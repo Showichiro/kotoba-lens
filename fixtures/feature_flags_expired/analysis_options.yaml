@@ -1,0 +1,4 @@
+plugins:
+  feature_flag_lifecycle_plugin:
+    path: ../../packages/feature_flag_lifecycle_plugin
+

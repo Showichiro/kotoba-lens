@@ -4,3 +4,5 @@ artifacts/
 *.log
 qa/.chrome-profile*/
 qa/.edge-profile/
+
+.dart_tool/
