@@ -24,8 +24,8 @@
     "release": "changeset publish"
   },
   "devDependencies": {
-    "@changesets/cli": "^3.0.0",
-    "@types/chrome": "^0.2.6",
+    "@changesets/cli": "^3.0.1",
+    "@types/chrome": "^0.2.7",
     "@types/dom-chromium-ai": "^0.0.17",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
